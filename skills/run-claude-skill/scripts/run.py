@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 
-NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]*\Z")
+NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*\Z")
 AUTH_RECIPE = [
     "For a Claude subscription, run `claude setup-token` in an interactive terminal. "
     "Open its authorization URL in a browser and finish the displayed prompts. "
@@ -45,9 +45,14 @@ EXIT_CODES = {
 
 
 def redact(value: str) -> str:
+    secrets = set()
     for key, secret in os.environ.items():
         if len(secret) >= 8 and re.search(r"(?:TOKEN|API_KEY|PASSWORD|SECRET)$", key):
-            value = value.replace(secret, "[REDACTED]")
+            # Diagnostics may contain a JSON encoding of the credential.
+            secrets.update([secret, json.dumps(secret)[1:-1],
+                            json.dumps(secret, ensure_ascii=False)[1:-1]])
+    for secret in sorted(secrets, key=len, reverse=True):
+        value = value.replace(secret, "[REDACTED]")
     value = re.sub(r"\bsk-ant-[A-Za-z0-9_-]+", "[REDACTED]", value)
     value = re.sub(r"(?i)(\bBearer\s+)[^\s\"'<>]+", r"\1[REDACTED]", value)
     return value
@@ -68,6 +73,24 @@ def config_dir() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")).expanduser().resolve()
 
 
+def inherited_worktree_skills(root: Path) -> Path | None:
+    """Find the main checkout's skills through a linked worktree's Git metadata."""
+    marker = root / ".git"
+    if not marker.is_file() or (root / ".claude/skills").is_dir():
+        return None
+    content = marker.read_text().strip()
+    if not content.startswith("gitdir:"):
+        return None
+    git_dir = (root / content.removeprefix("gitdir:").strip()).resolve()
+    common_file = git_dir / "commondir"
+    if not common_file.is_file():
+        return None
+    common_dir = (git_dir / common_file.read_text().strip()).resolve()
+    if common_dir.name != ".git" or not common_dir.is_dir():
+        return None
+    return common_dir.parent / ".claude"
+
+
 def read_json(path: Path) -> dict:
     try:
         value = json.loads(path.read_text())
@@ -82,7 +105,9 @@ def skill_name(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
     if text.startswith("---\n"):
         frontmatter = text[4:].split("\n---", 1)[0]
-        match = re.search(r"(?m)^name:\s*(['\"]?)([A-Za-z0-9][A-Za-z0-9_-]*)\1\s*$", frontmatter)
+        match = re.search(
+            r"(?m)^name:[ \t]*(['\"]?)([A-Za-z0-9][A-Za-z0-9_.-]*(?::[A-Za-z0-9][A-Za-z0-9_.-]*)*)"
+            r"\1(?:[ \t]+#[^\n]*)?[ \t]*$", frontmatter)
         if match:
             return match[2]
     return path.parent.name if path.name == "SKILL.md" else path.stem
@@ -118,43 +143,147 @@ def confined(root: Path, entry: str) -> Path:
     return path
 
 
-def plugin_procedure(root: Path, namespace: str, name: str) -> Path | None:
+def marketplace_entry(identity: str) -> dict:
+    entry_name, separator, marketplace = identity.partition("@")
+    registry = config_dir() / "plugins/known_marketplaces.json"
+    if not separator or not registry.is_file():
+        return {}
+    record = read_json(registry).get(marketplace)
+    if not record:
+        return {}
+    if not isinstance(record, dict) or not isinstance(record.get("installLocation"), str):
+        raise Failure("invalid_request", f"Invalid marketplace record for {marketplace}")
+    location = Path(record["installLocation"]).expanduser()
+    catalog = location if location.is_file() else location / ".claude-plugin/marketplace.json"
+    if not catalog.is_file():
+        return {}
+    entries = read_json(catalog).get("plugins", [])
+    if not isinstance(entries, list):
+        raise Failure("invalid_request", f"Invalid plugins list in {catalog}")
+    matches = [entry for entry in entries if isinstance(entry, dict) and entry.get("name") == entry_name]
+    if len(matches) > 1:
+        raise Failure("invalid_request", f"Duplicate marketplace entries for {identity}")
+    return matches[0] if matches else {}
+
+
+def plugin_procedure(root: Path, namespace: str, name: str, *, installed_name=None, entry=None) -> Path | None:
     manifest = root / ".claude-plugin/plugin.json"
-    if not manifest.is_file():
+    if not root.is_dir():
         return None
-    data = read_json(manifest)
+    entry = entry or {}
+    has_manifest = manifest.is_file()
+    data = read_json(manifest) if has_manifest else entry or {"name": installed_name or root.name}
+    extra = entry if has_manifest else {}
+    components = {"commands", "agents", "skills", "hooks", "outputStyles", "themes"}
+    if has_manifest and entry.get("strict") is False and components.intersection(entry):
+        raise Failure("invalid_request", f"Plugin {namespace} has conflicting marketplace and file manifests")
     if data.get("name") != namespace:
         raise Failure("invalid_request", f"Plugin manifest at {root} does not identify {namespace}")
     matches = set()
-    # Default directories load alongside custom paths, as Claude's plugin format specifies.
+    restricted_skills = entry.get("source") in (".", "./") and bool(entry.get("skills"))
+    if "skills" not in data and "skills" not in extra and not (root / "skills").is_dir() and (root / "SKILL.md").is_file():
+        candidate = confined(root, "SKILL.md")
+        if skill_name(candidate).removeprefix(namespace + ":") == name:
+            matches.add(candidate)
+    # Skills add to their default scan; commands replace it when declared.
     for key, default in [("skills", "./skills"), ("commands", "./commands")]:
-        declared = data.get(key, [])
-        entries = [declared] if isinstance(declared, str) else declared
-        if not isinstance(entries, list):
-            raise Failure("invalid_request", f"Invalid {key} declaration in {manifest}")
-        for entry in [default, *entries]:
-            path = confined(root, entry)
+        declared = data.get(key, [] if key == "skills" else default)
+        declarations = []
+        for value in [declared, extra.get(key, [])]:
+            if isinstance(value, (str, dict)):
+                declarations.append(value)
+            elif isinstance(value, list):
+                declarations.extend(value)
+            else:
+                raise Failure("invalid_request", f"Invalid {key} declaration in {manifest}")
+        if key == "skills":
+            if restricted_skills:
+                selected = entry["skills"]
+                declarations = [selected] if isinstance(selected, str) else selected
+                if not isinstance(declarations, list):
+                    raise Failure("invalid_request", "Marketplace skills must be a path or a list of paths")
+            else:
+                declarations.insert(0, default)
+        for declared in declarations:
+            if key == "commands" and isinstance(declared, dict):
+                for command_name, definition in declared.items():
+                    if not isinstance(definition, dict) or ("source" in definition) == ("content" in definition):
+                        raise Failure("invalid_request", f"Invalid command {command_name!r} in {manifest}")
+                    if "source" in definition:
+                        source = confined(root, definition["source"])
+                        if command_name == name and source.is_file():
+                            matches.add(source)
+                    elif not isinstance(definition["content"], str):
+                        raise Failure("invalid_request", f"Invalid command content in {manifest}")
+                    elif command_name == name:
+                        matches.add(manifest)
+                continue
+            path = confined(root, declared)
             if path.is_file():
                 candidates = [path]
             elif path.is_dir():
-                candidates = path.rglob("SKILL.md" if key == "skills" else "*.md")
+                if key == "skills":
+                    candidates = [path / "SKILL.md"] if (path / "SKILL.md").is_file() else path.glob("*/SKILL.md")
+                else:
+                    candidates = path.rglob("*.md")
             else:
                 continue
             for candidate in candidates:
-                candidate = confined(root, str(candidate.relative_to(root)))
-                if skill_name(candidate) == name:
-                    matches.add(candidate)
+                checked = confined(root, str(candidate.relative_to(root)))
+                if key == "skills":
+                    actual = skill_name(candidate).removeprefix(namespace + ":")
+                else:
+                    actual = ":".join(candidate.relative_to(path).with_suffix("").parts) if path.is_dir() else candidate.stem
+                if actual == name:
+                    matches.add(checked)
     if len(matches) > 1:
         raise Failure("skill_ambiguous", f"Multiple procedures identify {namespace}:{name} in {root}",
                       ["Fix duplicate skill names in the plugin, or pass one exact --skill-file."])
     return next(iter(matches), None)
 
 
+def local_procedure(skill: str, cwd: Path) -> Path | None:
+    # Personal skills win over project skills, matching Claude's documented precedence.
+    project_roots = []
+    for parent in [cwd, *cwd.parents]:
+        project_roots.append(parent)
+        if (parent / ".git").exists():
+            break
+    # Plain names belong to the project root before nested project locations.
+    # Only skills inherit from a main checkout; legacy commands remain local.
+    locations = [(config_dir(), config_dir())]
+    for project in reversed(project_roots):
+        root = project / ".claude"
+        locations.append((inherited_worktree_skills(project) or root, root))
+    locations = list(dict.fromkeys(locations))
+    parts = skill.split(":")
+    paths = [root / "skills" / skill / "SKILL.md" for root, _ in locations] if len(parts) == 1 else []
+    command = Path(*parts[:-1]) / f"{parts[-1]}.md"
+    paths += [root / "commands" / command for _, root in locations]
+    for path in paths:
+        if path.is_file():
+            # Skills precede legacy commands even across different locations.
+            # Directory/file names remain invocable even with a frontmatter alias.
+            return path.resolve()
+    if len(parts) > 1:
+        return None
+    # An alias must not shadow an existing directory or command name.
+    for root in dict.fromkeys(skill_root for skill_root, _ in locations):
+        matches = sorted(path.resolve() for path in (root / "skills").glob("*/SKILL.md")
+                         if skill_name(path) == skill)
+        if len(set(matches)) > 1:
+            raise Failure("skill_ambiguous", f"Multiple local skills identify {skill}",
+                          ["Select the intended skill with --skill-file /exact/path/SKILL.md."])
+        if matches:
+            return matches[0]
+    return None
+
+
 def resolve(skill: str, *, cwd: Path, skill_file=None, plugin_dir=None, marketplace=None) -> dict:
     skill = skill.removeprefix("/")
     parts = skill.split(":")
-    if len(parts) > 2 or any(not NAME.fullmatch(part) for part in parts):
-        raise Failure("invalid_request", "Use a skill name or plugin:skill; pass arguments through --prompt")
+    if any(not NAME.fullmatch(part) for part in parts):
+        raise Failure("invalid_request", "Use a skill name or plugin:skill (including nested command segments); pass arguments through --prompt")
     if skill in {"run-claude-skill", "run-claude-skill:run-claude-skill"}:
         raise Failure("invalid_request", "Select the task skill, not this launcher itself")
     if skill_file and plugin_dir:
@@ -166,41 +295,64 @@ def resolve(skill: str, *, cwd: Path, skill_file=None, plugin_dir=None, marketpl
         if not path.is_file() or path.name != "SKILL.md":
             raise Failure("skill_not_found", f"Local SKILL.md is missing: {path}", install_recipe(parts[-1]))
         actual = skill_name(path)
-        if actual != skill or not NAME.fullmatch(actual):
-            raise Failure("invalid_request", f"--skill must match local skill name {actual!r}")
+        if skill not in {actual, path.parent.name} or not NAME.fullmatch(actual):
+            raise Failure("invalid_request", f"--skill must match local skill name {actual!r} or directory name")
         return {"skill": skill, "file": path}
-    if len(parts) == 2:
-        namespace, name = parts
+    if len(parts) >= 2:
+        namespace, name = parts[0], ":".join(parts[1:])
         if plugin_dir:
             root = Path(plugin_dir).expanduser().resolve()
             if not plugin_procedure(root, namespace, name):
                 raise Failure("skill_not_found", f"Skill {skill} is unavailable at {root}",
                               install_recipe(skill, marketplace))
             return {"skill": skill, "root": root}
+        # Nested local commands also use colons; an explicit plugin root wins.
+        local = local_procedure(skill, cwd)
+        if local:
+            return {"skill": skill, "file": local}
         registry = config_dir() / "plugins/installed_plugins.json"
         plugins = read_json(registry).get("plugins", {}) if registry.exists() else {}
         if not isinstance(plugins, dict):
             raise Failure("invalid_request", f"Invalid plugin registry: {registry}")
         matches, identities = [], []
         for identity, records in plugins.items():
-            if identity.split("@", 1)[0] != namespace:
-                continue
-            identities.append(identity)
+            related = identity.split("@", 1)[0] == namespace
+            if related:
+                identities.append(identity)
             if not isinstance(records, list):
-                raise Failure("invalid_request", f"Invalid registry records for {identity}")
+                if related:
+                    raise Failure("invalid_request", f"Invalid registry records for {identity}")
+                continue
             for record in records:
                 if not isinstance(record, dict) or not isinstance(record.get("installPath"), str):
-                    raise Failure("invalid_request", f"Invalid installation record for {identity}")
+                    if related:
+                        raise Failure("invalid_request", f"Invalid installation record for {identity}")
+                    continue
+                root = Path(record["installPath"]).expanduser().resolve()
+                manifest = root / ".claude-plugin/plugin.json"
+                try:
+                    declared_name = read_json(manifest).get("name") if manifest.is_file() else identity.split("@", 1)[0]
+                except Failure:
+                    if related:
+                        raise
+                    continue
+                # Marketplace entry identities need not equal command namespaces.
+                if declared_name != namespace:
+                    continue
+                if identity not in identities:
+                    identities.append(identity)
                 if record.get("scope") in ("project", "local"):
                     project = record.get("projectPath")
-                    if not project or not cwd.is_relative_to(Path(project).expanduser().resolve()):
+                    if not isinstance(project, str) or not project:
+                        raise Failure("invalid_request", f"Invalid projectPath for {identity}")
+                    if not cwd.is_relative_to(Path(project).expanduser().resolve()):
                         continue
-                root = Path(record["installPath"]).expanduser().resolve()
-                if plugin_procedure(root, namespace, name):
-                    matches.append(root)
+                entry = marketplace_entry(identity)
+                if plugin_procedure(root, namespace, name, installed_name=declared_name, entry=entry):
+                    matches.append((root, identity))
         matches = list(dict.fromkeys(matches))
         if len(matches) == 1:
-            return {"skill": skill, "root": matches[0]}
+            return {"skill": skill, "root": matches[0][0], "identity": matches[0][1]}
         if len(matches) > 1:
             raise Failure("skill_ambiguous", f"Multiple installations provide {skill}",
                           ["Select the intended plugin with --plugin-dir /exact/plugin/root."])
@@ -209,25 +361,19 @@ def resolve(skill: str, *, cwd: Path, skill_file=None, plugin_dir=None, marketpl
                       install_recipe(skill, marketplace, identity))
     if plugin_dir:
         raise Failure("invalid_request", "--plugin-dir requires plugin:skill")
-    # Personal skills win over project skills, matching Claude's documented precedence.
-    roots = [config_dir()]
-    for parent in [cwd, *cwd.parents]:
-        roots.append(parent / ".claude")
-        if (parent / ".git").exists():
-            break
-    for root in dict.fromkeys(roots):
-        matches = []
-        for path in [root / "skills" / skill / "SKILL.md", root / "commands" / f"{skill}.md"]:
-            if path.is_file() and skill_name(path) == skill:
-                matches.append(path.resolve())
-        if matches:
-            # A skill takes precedence over an identically named legacy command.
-            return {"skill": skill, "file": matches[0]}
+    path = local_procedure(skill, cwd)
+    if path:
+        return {"skill": skill, "file": path}
     raise Failure("skill_not_found", f"Local Claude skill {skill} was not found", install_recipe(skill))
 
 
 @contextlib.contextmanager
 def loaded_target(target: dict):
+    if "identity" in target:
+        # Native loading preserves marketplace declarations, merge rules, and
+        # installed namespaces. The --settings overlay is process-local.
+        yield target["skill"], None, None
+        return
     if "root" in target:
         yield target["skill"], target["root"], None
         return
@@ -242,9 +388,11 @@ def loaded_target(target: dict):
             destination = root / "skills" / target["skill"]
             destination.parent.mkdir()
             destination.symlink_to(source.parent, target_is_directory=True)
+            name = skill_name(destination / "SKILL.md")
         else:
             (root / "commands").symlink_to(source.parent, target_is_directory=True)
-        yield namespace + ":" + target["skill"], root, source.parent
+            name = source.stem
+        yield namespace + ":" + name, root, source.parent
 
 
 def classify(text: str) -> tuple[str, list[str]]:
@@ -305,18 +453,18 @@ def decode_result(stdout: str, stderr: str, code: int) -> dict:
             status = "invalid_response"
             recovery = ["Claude returned no valid JSON result envelope. Check CLI compatibility "
                         "and hooks that write to stdout; do not infer successful completion."]
-        return outcome(status, diagnostic[:8000] or "Claude produced no result", recovery=recovery,
+        return outcome(status, redact(diagnostic)[:8000] or "Claude produced no result", recovery=recovery,
                        claude_exit_code=code)
     result = envelope.get("result")
     output = result if isinstance(result, str) else ""
     failed = code != 0 or envelope.get("is_error") is not False or envelope.get("subtype") != "success"
     # Some CLI versions report account limits as a successful plain-text result.
-    cli_error = re.match(r"\A\s*(?:API Error:|Error:|Not (?:logged|signed) in(?:\s*[.·!]|\s*Please|\s*$)|"
+    cli_error = re.match(r"\A\s*(?:API Error:|Not (?:logged|signed) in(?:\s*[.·!]|\s*Please|\s*$)|"
                          r"You['’]ve hit your limit\b|You have hit your limit\b|"
                          r"Unknown (?:skill|slash command):)",
                          output, re.I)
     failure_notice = failed and re.match(
-        r"\A\s*(?:Not (?:logged|signed) in\b|authentication[_ ](?:failed|error)|"
+        r"\A\s*(?:Error:|Not (?:logged|signed) in\b|authentication[_ ](?:failed|error)|"
         r"not authenticated\b|(?:missing|no) (?:authentication|credentials|API key)\b|"
         r"invalid (?:API key|credentials)|(?:OAuth |access )?token (?:expired|revoked)|"
         r"out of (?:tokens|credits)\b|(?:usage|session|weekly|quota|rate) limit\b|"
@@ -338,7 +486,7 @@ def decode_result(stdout: str, stderr: str, code: int) -> dict:
             status, recovery = classify(metadata)
         else:
             status, recovery = classify(evidence)
-        return outcome(status, evidence.strip()[:8000], output=output, recovery=recovery,
+        return outcome(status, redact(evidence.strip())[:8000], output=output, recovery=recovery,
                        claude_exit_code=code)
     if envelope.get("permission_denials"):
         return outcome("permission_denied", "Claude reported denied tools; completion cannot be assumed.",
@@ -383,7 +531,11 @@ def run(args) -> dict:
         ])
     with loaded_target(target) as (invocation, root, extra_dir):
         command = [binary, "--permission-mode", args.permission_mode, "--permission-prompts", "none",
-                   "--no-session-persistence", "--output-format", "json", "--plugin-dir", str(root)]
+                   "--no-session-persistence", "--output-format", "json"]
+        if "identity" in target:
+            command += ["--settings", json.dumps({"enabledPlugins": {target["identity"]: True}})]
+        else:
+            command += ["--plugin-dir", str(root)]
         if extra_dir:
             command += ["--add-dir", str(extra_dir)]
         if args.max_turns:

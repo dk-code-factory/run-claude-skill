@@ -48,7 +48,9 @@ python3 skills/run-claude-skill/scripts/run.py \
 
 Local skills load through a temporary namespaced plugin; the entire skill folder
 and its supporting files stay available. Installed plugins resolve from Claude's
-registry and manifest, respecting project scope. Ambiguous installations require
+registry, marketplace entries, and manifests, respecting project scope. The
+selected plugin is enabled for the child process without changing saved settings.
+Ambiguous installations require
 `--plugin-dir`. Personal/project skills can also be selected by plain name.
 Use `--marketplace OWNER/REPO` to provide a verified source for missing-plugin
 installation instructions. The runner never guesses repositories or installs
