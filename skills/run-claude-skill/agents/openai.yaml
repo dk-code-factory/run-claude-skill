@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claude Skill"
+  short_description: "Run a selected skill through Claude CLI"
+  default_prompt: "Use $run-claude-skill to run my selected Claude review skill."

@@ -1,0 +1,6 @@
+{
+  "name": "run-claude-skill",
+  "description": "Run a selected Claude skill with explicit failure reports.",
+  "owner": {"name": "dk-code-factory"},
+  "plugins": [{"name": "run-claude-skill", "source": "./", "version": "1.0.0"}]
+}

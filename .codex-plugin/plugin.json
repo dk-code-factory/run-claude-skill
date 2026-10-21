@@ -1,0 +1,9 @@
+{
+  "name": "run-claude-skill",
+  "version": "1.0.0",
+  "description": "Run a selected Claude skill with explicit failure and recovery reports.",
+  "author": {"name": "Dmitry Kropachev"},
+  "license": "MIT",
+  "repository": "https://github.com/dk-code-factory/run-claude-skill",
+  "skills": "./skills/"
+}

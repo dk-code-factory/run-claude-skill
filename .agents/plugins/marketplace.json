@@ -1,0 +1,5 @@
+{
+  "name": "run-claude-skill",
+  "interface": {"displayName": "Claude Skill"},
+  "plugins": [{"name": "run-claude-skill", "source": {"source": "local", "path": "./"}}]
+}
