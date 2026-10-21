@@ -249,7 +249,8 @@ def loaded_target(target: dict):
 
 def classify(text: str) -> tuple[str, list[str]]:
     rules = [
-        ("auth_required", r"authentication[_ ](?:failed|error|required)|not (?:logged|signed) in|"
+        ("auth_required", r"authentication[_ ](?:failed|error|required)|not authenticated|not (?:logged|signed) in|"
+         r"(?:missing|no) (?:authentication|credentials|api[_ ]key)|"
          r"invalid[_ ](?:api[_ ]key|credentials|oauth[_ ]token)|(?:expired|revoked|invalid).{0,30}(?:oauth |access |auth )?token|"
          r"token.{0,30}(?:expired|revoked)|\b401\b|please (?:run |use )?/?login", AUTH_RECIPE),
         ("skill_not_found", r"unknown (?:skill|slash command)|(?:skill|slash command).{0,80}(?:not found|not available|does not exist)",
@@ -316,16 +317,27 @@ def decode_result(stdout: str, stderr: str, code: int) -> dict:
                          output, re.I)
     failure_notice = failed and re.match(
         r"\A\s*(?:Not (?:logged|signed) in\b|authentication[_ ](?:failed|error)|"
-        r"invalid (?:API key|credentials)|(?:OAuth |access )?token (?:expired|revoked))", output, re.I)
+        r"not authenticated\b|(?:missing|no) (?:authentication|credentials|API key)\b|"
+        r"invalid (?:API key|credentials)|(?:OAuth |access )?token (?:expired|revoked)|"
+        r"out of (?:tokens|credits)\b|(?:usage|session|weekly|quota|rate) limit\b|"
+        r"credit balance\b|prompt is too long\b|context_length_exceeded|max_output_tokens|"
+        r"ECONN\w+|ENOTFOUND|EAI_AGAIN|fetch failed|failed to fetch|connection (?:error|failed))",
+        output, re.I)
     if failed or cli_error:
         subtype = str(envelope.get("subtype", ""))
         known_limit = subtype in {"error_max_turns", "error_max_budget_usd", "error_max_output_tokens"}
         errors = envelope.get("errors", [])
         # Partial task output can mention authentication or quotas while reviewing
         # those features. Classify CLI metadata, not arbitrary review prose.
-        evidence = "\n".join(filter(None, [subtype, json.dumps(errors) if errors else "",
+        metadata = json.dumps(errors) if errors else ""
+        evidence = "\n".join(filter(None, [subtype, metadata,
                                               output if cli_error or failure_notice else "", stderr]))
-        status, recovery = classify(subtype if known_limit else evidence)
+        if known_limit:
+            status, recovery = classify(subtype)
+        elif metadata:
+            status, recovery = classify(metadata)
+        else:
+            status, recovery = classify(evidence)
         return outcome(status, evidence.strip()[:8000], output=output, recovery=recovery,
                        claude_exit_code=code)
     if envelope.get("permission_denials"):

@@ -112,6 +112,24 @@ class ResultTests(unittest.TestCase):
         self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", steps)
         self.assertIn("same shell", steps)
 
+    def test_result_only_cli_failure_notices_have_specific_recovery(self):
+        for notice, expected in [("Out of tokens", "usage_limit"),
+                                 ("Not authenticated", "auth_required"),
+                                 ("Usage limit reached", "usage_limit"),
+                                 ("Rate limit reached", "rate_limited"),
+                                 ("No API key found", "auth_required")]:
+            with self.subTest(notice=notice):
+                result = runner.decode_result(json.dumps(envelope(
+                    notice, is_error=True, subtype="error_during_execution")), "", 1)
+                self.assertEqual(result["status"], expected)
+                self.assertTrue(result["recovery"])
+
+    def test_structured_error_wins_over_auth_text_in_partial_answer(self):
+        result = runner.decode_result(json.dumps(envelope(
+            "Not authenticated is the wrong UI state", is_error=True,
+            errors=["ECONNRESET"])), "", 1)
+        self.assertEqual(result["status"], "network_error")
+
     def test_missing_invalid_empty_and_contradictory_envelopes_fail(self):
         for text in ["", "looks done", "{}", "[]", "null", json.dumps(envelope("")),
                      json.dumps(envelope(None)), '{"type":"result","result":"done"}']:
@@ -397,7 +415,7 @@ class PackagingTests(unittest.TestCase):
     def test_both_hosts_select_the_same_self_contained_skill(self):
         for host in ["claude", "codex"]:
             manifest = json.loads((ROOT / f".{host}-plugin/plugin.json").read_text())
-            self.assertEqual(manifest["version"], "1.0.0")
+            self.assertEqual(manifest["version"], "1.0.1")
             self.assertEqual(manifest["name"], "run-claude-skill")
             self.assertTrue((ROOT / manifest["skills"] / "run-claude-skill/SKILL.md").is_file())
             self.assertTrue((ROOT / manifest["skills"] / "run-claude-skill/scripts/run.py").is_file())
