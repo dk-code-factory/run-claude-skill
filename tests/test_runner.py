@@ -25,6 +25,7 @@ def envelope(result="Review complete", **kwargs):
 class ResultTests(unittest.TestCase):
     def test_success_preserves_findings_without_imposing_a_schema(self):
         for text in ["No findings", "Standards: minor bug", '{"custom_review": []}',
+                     "Error: foo.py:10 drops the returned promise.",
                      "Authentication failed is the expected error in this unit test."]:
             with self.subTest(text=text):
                 result = runner.decode_result(json.dumps(envelope(text)), "warning", 0)
@@ -159,6 +160,39 @@ class ResultTests(unittest.TestCase):
                         self.assertNotIn(value, json.dumps(result))
                         self.assertIn("[REDACTED]", json.dumps(result))
 
+    def test_truncation_cannot_expose_credential_prefix(self):
+        secret = "opaque-long-secret-for-test-0123456789"
+        diagnostic = "a" * 7990 + secret
+        with patch.dict(os.environ, {"EXAMPLE_TOKEN": secret}):
+            for stdout in ["", json.dumps(envelope("Partial", is_error=True, errors=[diagnostic]))]:
+                with self.subTest(stdout=bool(stdout)):
+                    result = runner.decode_result(stdout, diagnostic, 1)
+                    self.assertNotIn(secret[:10], json.dumps(result))
+                    if not stdout:
+                        self.assertIn("[REDACTED]", result["message"])
+
+    def test_json_escaped_credentials_are_redacted(self):
+        secret = 'testing-only-opaque"secret\\012345-ñ'
+        with patch.dict(os.environ, {"EXAMPLE_PASSWORD": secret}):
+            for ensure_ascii in [True, False]:
+                text = json.dumps(envelope("Partial", is_error=True, errors=[secret]),
+                                  ensure_ascii=ensure_ascii)
+                failure = runner.decode_result(text, "", 1)
+                metadata = json.loads(failure["message"].split("\n", 1)[1])
+                self.assertEqual(metadata, ["[REDACTED]"])
+                text = json.dumps(envelope("Partial", permission_denials=[{"tool_input": secret}]),
+                                  ensure_ascii=ensure_ascii)
+                denial = runner.decode_result(text, "", 0)
+                self.assertEqual(json.loads(denial["diagnostic"]), [{"tool_input": "[REDACTED]"}])
+                # Raw malformed stdout can contain the same encoded credential.
+                raw = runner.decode_result(text + "noise", "", 1)
+                self.assertNotIn(json.dumps(secret, ensure_ascii=ensure_ascii)[1:-1], raw["message"])
+
+    def test_generic_error_prefix_still_classifies_failed_envelope(self):
+        text = json.dumps(envelope("Error: Not logged in", is_error=True,
+                                   subtype="error_during_execution"))
+        self.assertEqual(runner.decode_result(text, "", 1)["status"], "auth_required")
+
 
 class RunnerTests(unittest.TestCase):
     def setUp(self):
@@ -181,10 +215,19 @@ class RunnerTests(unittest.TestCase):
 import json, os, pathlib, subprocess, sys, time
 args = sys.argv[1:]
 prompt = sys.stdin.read()
-root = pathlib.Path(args[args.index('--plugin-dir') + 1])
+if '--plugin-dir' in args:
+    root = pathlib.Path(args[args.index('--plugin-dir') + 1])
+    installed_name = root.name
+else:
+    settings = json.loads(args[args.index('--settings') + 1])
+    identity = next(key for key, enabled in settings['enabledPlugins'].items() if enabled)
+    registry = pathlib.Path(os.environ['CLAUDE_CONFIG_DIR']) / 'plugins/installed_plugins.json'
+    root = pathlib.Path(json.loads(registry.read_text())['plugins'][identity][0]['installPath'])
+    installed_name = identity.split('@', 1)[0]
+manifest = root / '.claude-plugin/plugin.json'
 record = {'args': args, 'prompt': prompt, 'cwd': os.getcwd(), 'pid': os.getpid(),
           'nested_marker': os.environ.get('CLAUDECODE'),
-          'plugin': json.loads((root / '.claude-plugin/plugin.json').read_text())}
+          'plugin': json.loads(manifest.read_text()) if manifest.is_file() else {'name': installed_name}}
 record['support'] = [p.read_text() for p in root.glob('skills/*/references/evidence.txt')]
 if os.environ.get('FAKE_HANG'):
     child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)'])
@@ -219,6 +262,15 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         path = self.config / "plugins/installed_plugins.json"
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps({"plugins": plugins}))
+
+    def marketplace(self, entries):
+        location = self.root / "marketplace"
+        catalog = location / ".claude-plugin/marketplace.json"
+        catalog.parent.mkdir(parents=True, exist_ok=True)
+        catalog.write_text(json.dumps({"name": "test-market", "plugins": entries}))
+        (self.config / "plugins/known_marketplaces.json").write_text(json.dumps({
+            "test-market": {"installLocation": str(location)},
+        }))
 
     def cli(self, *options, env=None, skill="reviewer:review", text_mode=False):
         args = [sys.executable, str(SCRIPT), "--skill", skill, "--cwd", str(self.cwd), *options]
@@ -286,12 +338,271 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
             result = runner.resolve("inspect", cwd=self.cwd)
         self.assertEqual(result["file"], self.config / "skills/inspect/SKILL.md")
 
+    def test_root_project_skill_wins_over_nested_skill_for_plain_name(self):
+        nested = self.cwd / "packages/web"
+        nested.mkdir(parents=True)
+        for project in [self.cwd, nested]:
+            path = project / ".claude/skills/inspect/SKILL.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("Inspect selected changes")
+        with patch.dict(os.environ, self.env):
+            target = runner.resolve("inspect", cwd=nested)
+        self.assertEqual(target["file"], self.cwd / ".claude/skills/inspect/SKILL.md")
+
+    def test_project_skill_wins_over_personal_legacy_command(self):
+        command = self.config / "commands/inspect.md"
+        command.parent.mkdir()
+        command.write_text("Legacy instructions")
+        skill = self.cwd / ".claude/skills/inspect/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("Current skill instructions")
+        with patch.dict(os.environ, self.env):
+            self.assertEqual(runner.resolve("inspect", cwd=self.cwd)["file"], skill)
+
+    def test_linked_worktree_inherits_main_checkout_skills_only(self):
+        # Model Git's on-disk worktree metadata without requiring Git at runtime.
+        worktree = self.root / "linked"
+        worktree.mkdir()
+        git_dir = self.cwd / ".git/worktrees/linked"
+        git_dir.mkdir(parents=True)
+        (git_dir / "commondir").write_text("../..\n")
+        (worktree / ".git").write_text(f"gitdir: {git_dir}\n")
+        main_skill = self.cwd / ".claude/skills/inspect/SKILL.md"
+        main_skill.parent.mkdir(parents=True)
+        main_skill.write_text("Inspect main checkout")
+        main_command = self.cwd / ".claude/commands/other.md"
+        main_command.parent.mkdir()
+        main_command.write_text("Main-only command")
+        with patch.dict(os.environ, self.env):
+            target = runner.resolve("inspect", cwd=worktree)
+            self.assertEqual(target["file"], main_skill)
+            with self.assertRaises(runner.Failure) as failure:
+                runner.resolve("other", cwd=worktree)
+            self.assertEqual(failure.exception.result["status"], "skill_not_found")
+            own_skill = worktree / ".claude/skills/inspect/SKILL.md"
+            own_skill.parent.mkdir(parents=True)
+            own_skill.write_text("Inspect linked checkout")
+            self.assertEqual(runner.resolve("inspect", cwd=worktree)["file"], own_skill)
+            # Even an empty skills directory opts out of inheritance.
+            own_skill.unlink()
+            with self.assertRaises(runner.Failure):
+                runner.resolve("inspect", cwd=worktree)
+
+    def test_local_skill_resolves_by_alias_and_folder_name(self):
+        path = self.config / "skills/alias-folder/SKILL.md"
+        path.parent.mkdir(parents=True)
+        path.write_text("---\nname: alias\n---\nInspect")
+        for name in ["alias", "alias-folder"]:
+            with self.subTest(name=name):
+                proc, result = self.cli(skill=name)
+                self.assertEqual(proc.returncode, 0, result)
+                record = json.loads(self.log.read_text())
+                self.assertTrue(record["prompt"].endswith(":alias"))
+
+    def test_symlinked_skill_without_name_uses_loaded_folder_name(self):
+        source = self.root / "source-folder"
+        source.mkdir()
+        (source / "SKILL.md").write_text("Inspect selected changes")
+        skills = self.config / "skills"
+        skills.mkdir()
+        (skills / "inspect").symlink_to(source, target_is_directory=True)
+        proc, result = self.cli(skill="inspect")
+        self.assertEqual(proc.returncode, 0, result)
+        self.assertTrue(json.loads(self.log.read_text())["prompt"].endswith(":inspect"))
+
+    def test_local_alias_does_not_shadow_existing_directory_name(self):
+        for root, folder, name in [(self.config, "other", "inspect"),
+                                   (self.cwd / ".claude", "inspect", "project-review")]:
+            path = root / "skills" / folder / "SKILL.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(f"---\nname: {name}\n---\nInspect")
+        with patch.dict(os.environ, self.env):
+            target = runner.resolve("inspect", cwd=self.cwd)
+        self.assertEqual(target["file"], self.cwd / ".claude/skills/inspect/SKILL.md")
+
+    def test_duplicate_local_alias_requires_exact_file(self):
+        for folder in ["first", "second"]:
+            path = self.config / "skills" / folder / "SKILL.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("---\nname: alias\n---\nInspect")
+        proc, result = self.cli(skill="alias")
+        self.assertEqual(result["status"], "skill_ambiguous")
+        self.assertFalse(self.log.exists())
+
     def test_custom_manifest_and_legacy_plugin_command(self):
         for kind in ["custom", "command"]:
             with self.subTest(kind=kind):
                 plugin = self.make_plugin(self.root / kind, **{kind: True})
                 proc, result = self.cli("--plugin-dir", str(plugin))
                 self.assertEqual(proc.returncode, 0)
+
+    def test_manifestless_plugin_uses_directory_namespace(self):
+        (self.plugin / ".claude-plugin/plugin.json").unlink()
+        plugin = self.plugin.with_name("reviewer")
+        self.plugin.rename(plugin)
+        proc, result = self.cli("--plugin-dir", str(plugin))
+        self.assertEqual(proc.returncode, 0, result)
+        self.assertEqual(json.loads(self.log.read_text())["prompt"], "/reviewer:review")
+
+    def test_installed_manifestless_plugin_keeps_marketplace_namespace(self):
+        (self.plugin / ".claude-plugin/plugin.json").unlink()
+        cache = self.root / "plugins/cache/catalog/reviewer/1.0.0"
+        cache.parent.mkdir(parents=True)
+        self.plugin.rename(cache)
+        evidence = cache / "skills/review/references/evidence.txt"
+        evidence.parent.mkdir()
+        evidence.write_text("Bundled evidence")
+        self.registry({"reviewer@catalog": [{"scope": "user", "installPath": str(cache)}]})
+        proc, result = self.cli()
+        self.assertEqual(proc.returncode, 0, result)
+        record = json.loads(self.log.read_text())
+        self.assertEqual(record["plugin"]["name"], "reviewer")
+        self.assertEqual(record["prompt"], "/reviewer:review")
+        self.assertEqual(record["support"], ["Bundled evidence"])
+        self.assertNotIn("--plugin-dir", record["args"])
+        settings = json.loads(record["args"][record["args"].index("--settings") + 1])
+        self.assertEqual(settings, {"enabledPlugins": {"reviewer@catalog": True}})
+        self.assertFalse((cache / ".claude-plugin/plugin.json").exists())
+
+    def test_manifestless_root_skill_keeps_cache_basename_fallback(self):
+        cache = self.root / "plugins/cache/catalog/reviewer/1.0.0"
+        cache.mkdir(parents=True)
+        (cache / "SKILL.md").write_text("Review selected changes")
+        self.registry({"reviewer@catalog": [{"installPath": str(cache)}]})
+        proc, result = self.cli(skill="reviewer:1.0.0")
+        self.assertEqual(proc.returncode, 0, result)
+        record = json.loads(self.log.read_text())
+        self.assertEqual(record["plugin"]["name"], "reviewer")
+        self.assertEqual(record["prompt"], "/reviewer:1.0.0")
+        self.assertNotIn("--plugin-dir", record["args"])
+
+    def test_plugin_skill_can_include_its_own_namespace(self):
+        path = self.plugin / "skills/review/SKILL.md"
+        path.parent.rename(path.parent.with_name("inspect"))
+        path = self.plugin / "skills/inspect/SKILL.md"
+        path.write_text("---\nname: reviewer:review\n---\nInspect")
+        proc, result = self.cli()
+        self.assertEqual(proc.returncode, 0, result)
+        self.assertEqual(json.loads(self.log.read_text())["prompt"], "/reviewer:review")
+
+    def test_plugin_root_skill_fallback(self):
+        (self.plugin / "skills/review/SKILL.md").unlink()
+        (self.plugin / "skills/review").rmdir()
+        (self.plugin / "skills").rmdir()
+        (self.plugin / "SKILL.md").write_text("---\nname: review\n---\nInspect")
+        proc, result = self.cli()
+        self.assertEqual(proc.returncode, 0, result)
+        self.log.unlink()
+        (self.plugin / "skills").mkdir()
+        proc, result = self.cli()
+        self.assertEqual(result["status"], "skill_not_found")
+        self.assertFalse(self.log.exists())
+
+    def test_nested_plugin_commands_keep_directory_segments(self):
+        command = self.plugin / "commands/db/review.md"
+        command.parent.mkdir(parents=True)
+        command.write_text("Inspect database changes")
+        (self.plugin / "skills/review/SKILL.md").unlink()
+        proc, result = self.cli()
+        self.assertEqual(result["status"], "skill_not_found")
+        self.assertFalse(self.log.exists())
+        proc, result = self.cli(skill="reviewer:db:review")
+        self.assertEqual(proc.returncode, 0, result)
+        self.assertEqual(json.loads(self.log.read_text())["prompt"], "/reviewer:db:review")
+
+    def test_plugin_skill_discovery_excludes_supporting_skill_templates(self):
+        template = self.plugin / "skills/review/fixtures/example/SKILL.md"
+        template.parent.mkdir(parents=True)
+        template.write_text("---\nname: review\n---\nExample template")
+        proc, result = self.cli()
+        self.assertEqual(proc.returncode, 0, result)
+        self.log.unlink()
+        (self.plugin / "skills/review/SKILL.md").unlink()
+        proc, result = self.cli()
+        self.assertEqual(result["status"], "skill_not_found")
+        self.assertFalse(self.log.exists())
+
+    def test_nested_local_command_resolves_without_plugin_installation(self):
+        for root in [self.config, self.cwd / ".claude"]:
+            with self.subTest(root=root):
+                command = root / "commands/frontend/component.md"
+                command.parent.mkdir(parents=True)
+                command.write_text("Build selected component")
+                proc, result = self.cli(skill="frontend:component")
+                self.assertEqual(proc.returncode, 0, result)
+                self.assertTrue(json.loads(self.log.read_text())["prompt"].endswith(":component"))
+                command.unlink()
+
+    def test_explicit_plugin_root_overrides_same_named_local_command(self):
+        command = self.config / "commands/reviewer/review.md"
+        command.parent.mkdir(parents=True)
+        command.write_text("Legacy local review")
+        proc, result = self.cli("--plugin-dir", str(self.plugin))
+        self.assertEqual(proc.returncode, 0, result)
+        self.assertEqual(json.loads(self.log.read_text())["prompt"], "/reviewer:review")
+
+    def test_dotted_skill_name_is_used_for_plugin_and_local_invocations(self):
+        skill = self.plugin / "skills/review/SKILL.md"
+        skill.write_text("---\nname: review.pr\n---\nReview selected PR")
+        proc, result = self.cli(skill="reviewer:review.pr")
+        self.assertEqual(proc.returncode, 0, result)
+        proc, result = self.cli("--skill-file", str(skill), skill="review.pr")
+        self.assertEqual(proc.returncode, 0, result)
+        self.assertTrue(json.loads(self.log.read_text())["prompt"].endswith(":review.pr"))
+
+    def test_frontmatter_name_comments_preserve_selected_identity(self):
+        path = self.plugin / "skills/review/SKILL.md"
+        for name in ["alias # public invocation", "'alias' # public invocation", '"alias" # comment']:
+            with self.subTest(name=name):
+                path.write_text(f"---\nname: {name}\n---\nInspect")
+                proc, result = self.cli(skill="reviewer:alias")
+                self.assertEqual(proc.returncode, 0, result)
+                proc, result = self.cli("--skill-file", str(path), skill="review")
+                self.assertEqual(proc.returncode, 0, result)
+                self.assertTrue(json.loads(self.log.read_text())["prompt"].endswith(":alias"))
+
+    def test_command_map_supports_inline_and_named_source(self):
+        source = self.plugin / "chosen.md"
+        source.write_text("---\nname: ignored\n---\nReview")
+        manifest = self.plugin / ".claude-plugin/plugin.json"
+        manifest.write_text(json.dumps({"name": "reviewer", "commands": {
+            "inline": {"content": "Review selected changes."},
+            "from-file": {"source": "./chosen.md"},
+        }}))
+        for skill in ["reviewer:inline", "reviewer:from-file", "reviewer:review"]:
+            with self.subTest(skill=skill):
+                proc, result = self.cli(skill=skill)
+                self.assertEqual(proc.returncode, 0, result)
+                self.assertEqual(json.loads(self.log.read_text())["prompt"], "/" + skill)
+
+    def test_declared_commands_replace_default_directory(self):
+        default = self.plugin / "commands/review.md"
+        default.parent.mkdir()
+        default.write_text("Default review")
+        custom = self.plugin / "chosen/other.md"
+        custom.parent.mkdir()
+        custom.write_text("---\nname: ignored\n---\nChosen command")
+        manifest = self.plugin / ".claude-plugin/plugin.json"
+        manifest.write_text(json.dumps({"name": "reviewer", "commands": "./chosen"}))
+        # Remove the independent skill so only command resolution is tested.
+        (self.plugin / "skills/review/SKILL.md").unlink()
+        proc, result = self.cli()
+        self.assertEqual(result["status"], "skill_not_found")
+        self.assertFalse(self.log.exists())
+        proc, result = self.cli(skill="reviewer:other")
+        self.assertEqual(proc.returncode, 0, result)
+        custom.rename(custom.with_name("review.md"))
+        proc, result = self.cli()
+        self.assertEqual(proc.returncode, 0, result)
+
+    def test_command_map_source_cannot_escape_plugin_root(self):
+        manifest = self.plugin / ".claude-plugin/plugin.json"
+        manifest.write_text(json.dumps({"name": "reviewer", "commands": {
+            "review": {"source": "../outside.md"},
+        }}))
+        proc, result = self.cli()
+        self.assertEqual(result["status"], "invalid_request")
+        self.assertFalse(self.log.exists())
 
     def test_unrelated_project_installation_is_not_selected(self):
         self.registry({"reviewer@market": [{"scope": "project", "projectPath": str(self.root / "elsewhere"),
@@ -327,6 +638,78 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         proc, result = self.cli()
         self.assertIn("reviewer@known-market", " ".join(result["recovery"]))
 
+    def test_registry_identity_can_differ_from_manifest_namespace(self):
+        self.registry({"catalog-name@market": [{"scope": "user", "installPath": str(self.plugin)}]})
+        proc, result = self.cli()
+        self.assertEqual(proc.returncode, 0, result)
+        self.assertEqual(json.loads(self.log.read_text())["prompt"], "/reviewer:review")
+        proc, result = self.cli(skill="reviewer:missing")
+        self.assertEqual(result["status"], "skill_not_found")
+        self.assertIn("catalog-name@market", " ".join(result["recovery"]))
+
+    def test_marketplace_supplies_manifestless_plugin_components(self):
+        (self.plugin / ".claude-plugin/plugin.json").unlink()
+        skill = self.plugin / "custom/inspect/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("Inspect selected changes")
+        self.marketplace([{"name": "reviewer", "source": "./reviewer", "strict": False,
+                           "skills": ["./custom/"]}])
+        settings = self.config / "settings.json"
+        original = json.dumps({"enabledPlugins": {"reviewer@test-market": False}})
+        settings.write_text(original)
+        proc, result = self.cli(skill="reviewer:inspect")
+        self.assertEqual(proc.returncode, 0, result)
+        record = json.loads(self.log.read_text())
+        overlay = json.loads(record["args"][record["args"].index("--settings") + 1])
+        self.assertEqual(overlay, {"enabledPlugins": {"reviewer@test-market": True}})
+        self.assertNotIn("--plugin-dir", record["args"])
+        self.assertEqual(settings.read_text(), original)
+        self.assertFalse((self.plugin / ".claude-plugin/plugin.json").exists())
+
+    def test_marketplace_adds_to_existing_manifest_components(self):
+        skill = self.plugin / "custom/inspect/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("Inspect selected changes")
+        self.marketplace([{"name": "reviewer", "source": "./reviewer",
+                           "skills": "./custom", "commands": {"extra": {"content": "Extra review"}}}])
+        for name in ["review", "inspect", "extra"]:
+            proc, result = self.cli(skill="reviewer:" + name)
+            self.assertEqual(proc.returncode, 0, result)
+
+    def test_marketplace_strict_false_component_conflict_fails(self):
+        self.marketplace([{"name": "reviewer", "source": "./reviewer", "strict": False,
+                           "skills": ["./skills"]}])
+        proc, result = self.cli()
+        self.assertEqual(result["status"], "invalid_request")
+        self.assertFalse(self.log.exists())
+
+    def test_marketplace_root_skill_selection_excludes_default_scan(self):
+        skill = self.plugin / "custom/inspect/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("Inspect selected changes")
+        self.marketplace([{"name": "reviewer", "source": "./", "skills": ["./custom"]}])
+        proc, result = self.cli()
+        self.assertEqual(result["status"], "skill_not_found")
+        self.assertFalse(self.log.exists())
+        proc, result = self.cli(skill="reviewer:inspect")
+        self.assertEqual(proc.returncode, 0, result)
+
+    def test_marketplace_component_paths_cannot_escape_plugin_root(self):
+        self.marketplace([{"name": "reviewer", "source": "./reviewer", "skills": ["../outside"]}])
+        proc, result = self.cli()
+        self.assertEqual(result["status"], "invalid_request")
+        self.assertFalse(self.log.exists())
+
+    def test_unrelated_malformed_plugins_do_not_block_selected_plugin(self):
+        broken = self.root / "broken"
+        (broken / ".claude-plugin").mkdir(parents=True)
+        (broken / ".claude-plugin/plugin.json").write_text("{broken")
+        self.registry({"unrelated@market": [{"installPath": str(broken)}],
+                       "bad-record@market": "invalid", "bad-path@market": [None],
+                       "catalog-name@market": [{"installPath": str(self.plugin)}]})
+        proc, result = self.cli()
+        self.assertEqual(proc.returncode, 0, result)
+
     def test_missing_cli_has_install_recipe_without_launch(self):
         proc, result = self.cli(env=dict(self.env, PATH=""))
         self.assertEqual(result["status"], "claude_not_found")
@@ -354,6 +737,16 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         proc, result = self.cli()
         self.assertEqual(result["status"], "invalid_request")
         self.assertFalse(self.log.exists())
+
+    def test_invalid_project_path_reports_structured_error(self):
+        for project in [123, [], {}, None, ""]:
+            with self.subTest(project=project):
+                self.registry({"reviewer@market": [{"scope": "project", "projectPath": project,
+                                                   "installPath": str(self.plugin)}]})
+                proc, result = self.cli()
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(result["status"], "invalid_request")
+                self.assertFalse(self.log.exists())
 
     def test_model_failure_runs_once_and_never_reports_clean_review(self):
         env = dict(self.env, FAKE_REPLY=json.dumps(envelope("Not logged in", is_error=True)), FAKE_EXIT="1")
@@ -415,7 +808,7 @@ class PackagingTests(unittest.TestCase):
     def test_both_hosts_select_the_same_self_contained_skill(self):
         for host in ["claude", "codex"]:
             manifest = json.loads((ROOT / f".{host}-plugin/plugin.json").read_text())
-            self.assertEqual(manifest["version"], "1.0.1")
+            self.assertEqual(manifest["version"], "1.0.2")
             self.assertEqual(manifest["name"], "run-claude-skill")
             self.assertTrue((ROOT / manifest["skills"] / "run-claude-skill/SKILL.md").is_file())
             self.assertTrue((ROOT / manifest["skills"] / "run-claude-skill/scripts/run.py").is_file())

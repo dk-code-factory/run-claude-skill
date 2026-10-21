@@ -17,7 +17,9 @@ python3 /path/to/run-claude-skill/scripts/run.py \
 ```
 
 - Select the exact `plugin:skill` requested by the user. An installed personal
-  or project skill can use its plain name. For a local skill folder, supply
+  or project skill can use its plain name. Nested commands keep their folder
+  segments: `plugin:folder:command` in a plugin, or `folder:command` for a
+  personal/project command. For a local skill folder, supply
   `--skill NAME --skill-file /path/to/SKILL.md`; the complete folder stays
   available to Claude. `--plugin-dir` selects an explicit plugin checkout.
 - Pass the user's scope and arguments through `--prompt`; use `--prompt -`
